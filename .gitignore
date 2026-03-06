@@ -1,0 +1,13 @@
+# Large data files
+*.csv
+
+# Log files
+sv_service_log.txt
+
+# Build outputs
+native/build/
+src-tauri/target/
+
+# OS files
+.DS_Store
+Thumbs.db
