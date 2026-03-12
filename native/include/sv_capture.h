@@ -200,7 +200,7 @@ void sv_capture_get_stats(SvCaptureStats *stats);
  * {
  *   "packetsReceived": 12345,
  *   "packetsSV": 12340,
- *   "packetsDropped": 0,
+ *   " packetsDropped": 0,
  *   "bytesReceived": 1234567,
  *   "captureElapsedMs": 5000,
  *   "isCapturing": true
