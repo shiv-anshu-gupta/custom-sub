@@ -151,12 +151,16 @@ document.addEventListener('DOMContentLoaded', () => {
     SVNavbar.updateStatus('Ready', 'disconnected');
     console.log('[app] SV Subscriber initialized — component architecture');
 
-    // ── Pause rendering when window/tab is hidden (Page Visibility API) ──
+    // ── Pause rendering AND polling when window/tab is hidden (Page Visibility API) ──
+    // Stopping polling while hidden eliminates all IPC pressure on C++/Rust
+    // while the user can't see the data anyway.
     document.addEventListener('visibilitychange', () => {
         if (document.hidden) {
             stopRenderLoop();
+            stopPolling();   // Stop IPC poll — no point draining the C++ ring
         } else if (SVApp.connected) {
             startRenderLoop();
+            startPolling();  // Resume when tab is visible again
             SVApp._tableDirty = true; // Force refresh on return
         }
     });
@@ -413,13 +417,12 @@ async function pollData() {
         const hasFrames = result.frames && result.frames.length > 0;
 
         // ── Adaptive poll rate ──
-        // At high throughput (>80% of maxFrames returned), slow down to give
-        // C++ more time to accumulate frames — reduces IPC overhead.
-        // At low throughput (no data), speed up to reduce latency.
+        // Ring nearly full (≥80% of maxFrames returned): poll faster to drain.
+        // Idle (no frames): back off to reduce unnecessary IPC pressure.
         if (hasFrames && result.frames.length >= 1600) {
-            SVApp.pollRate = Math.min(SVApp.pollRate + 100, SVApp.pollRateMax);
-        } else if (!hasFrames) {
             SVApp.pollRate = Math.max(SVApp.pollRate - 50, SVApp.pollRateMin);
+        } else if (!hasFrames) {
+            SVApp.pollRate = Math.min(SVApp.pollRate + 100, SVApp.pollRateMax);
         } else {
             SVApp.pollRate = 300;
         }
@@ -431,17 +434,18 @@ async function pollData() {
         }
         if (result.captureStats) SVStats.updateCapture(result.captureStats);
 
-        // ── Config bar live data (detected sample rate + capture counters) ──
-        SVConfig.update(result.analysis || null, result.captureStats || null);
-        
-        // ── Npcap TX API mode detection (from dup-timestamp analysis) ──
-        if (result.analysis) {
-            SVConfig.updateNpcapApiBadge(result.analysis);
-        }
-        
-        // ── Timestamp precision badge ──
-        if (result.timestampInfo) {
-            SVConfig.updateTimestampBadge(result.timestampInfo);
+        // ── Config bar / badge updates (throttled to 1×/sec) ──
+        // These update DOM elements that change slowly (detected sample rate,
+        // capture counters, API-mode badge, timestamp precision badge).
+        // Running them on every poll (~3×/sec) wastes main-thread time for
+        // changes the user can't perceive at that frequency.
+        const _now = Date.now();
+        if (!SVApp._lastBadgeUpdate || (_now - SVApp._lastBadgeUpdate) >= 1000) {
+            SVApp._lastBadgeUpdate = _now;
+            SVConfig.update(result.analysis || null, result.captureStats || null);
+            if (result.analysis) SVConfig.updateNpcapApiBadge(result.analysis);
+            if (result.timestampInfo) SVConfig.updateTimestampBadge(result.timestampInfo);
+            SVTiming.update(result.analysis || null, result.captureStats || null);
         }
 
         // ── Phasor data (DFT/FFT computed in C++ MKL backend) ──
@@ -451,8 +455,7 @@ async function pollData() {
             console.warn('[app] poll result has frames but NO phasor key!', Object.keys(result));
         }
 
-        // ── Timing session live updates (elapsed, rate, interval) ──
-        SVTiming.update(result.analysis || null, result.captureStats || null);
+        // ── Timing session live updates handled in throttled block above ──
 
         if (result.status) {
             SVStats.updateFooter(
@@ -472,6 +475,13 @@ async function pollData() {
             // Soft-reset chart timeline (keeps plot alive, no placeholder flash)
             SVApp._pendingChartFrames = [];
             SVChart.resetData();
+        }
+
+        // ── Handle JSON truncation (4 MB C++ buffer reached) ──
+        // C++ set truncated:true instead of silently cutting off JSON.
+        // Accept the partial frame batch — analysis totals are still accurate.
+        if (result.truncated) {
+            console.warn('[app] Poll response truncated — partial frame batch accepted');
         }
 
         // ── Buffer new rows (NO DOM work — just array push) ──

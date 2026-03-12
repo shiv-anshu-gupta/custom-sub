@@ -219,6 +219,14 @@ int sv_capture_open(const char *device_name) {
     pcap_set_timeout(handle, SV_CAP_TIMEOUT_MS);
     pcap_set_buffer_size(handle, SV_CAP_BUFFER_SIZE);
 
+    /* Enable immediate mode — each SV packet wakes the capture thread
+     * individually instead of accumulating in TPACKET_V3 kernel blocks.
+     * Without this, at 4000 pkt/sec the kernel delivers packets in bursts
+     * and pcap_next_ex() returns immediately with buffered data, turning the
+     * capture loop into a 100% CPU busy-poll. With immediate mode the thread
+     * blocks in the kernel between packets (~250µs at 4 kHz). */
+    pcap_set_immediate_mode(handle, 1);
+
     /* Try nanosecond timestamp precision if available */
     g_nano_active = false;
 #ifdef PCAP_TSTAMP_PRECISION_NANO

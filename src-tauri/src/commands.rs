@@ -32,38 +32,49 @@ pub fn init_subscriber(sv_id: String, smp_cnt_max: u16) -> Result<Value, String>
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// Combined poll — returns frames + analysis + status in ONE call
-/// This is the ONLY data polling endpoint used by the frontend
+/// Combined poll — returns frames + analysis + status in ONE call.
+///
+/// Fast path (recording OFF, which is >99% of the time):
+///   Three C++ JSON strings are merged by string slicing — completely avoiding
+///   a parse → Value → re-serialize round trip of the potentially 4 MB payload.
+///
+/// Recording path (recording ON):
+///   Parse the merged JSON once to extract frames for SQLite, same cost
+///   as before.  is_recording() is an atomic bool load, so the check is free.
 #[tauri::command]
-pub fn poll_data(start_index: u32, max_frames: u32) -> Result<Value, String> {
-    // Get combined data from C++ (single mutex lock, single JSON build)
+pub fn poll_data(start_index: u32, max_frames: u32) -> Result<Box<serde_json::value::RawValue>, String> {
     let poll_json = ffi::get_poll_json(start_index, max_frames);
-    let mut poll_data: Value = serde_json::from_str(&poll_json)
-        .map_err(|e| format!("Poll JSON parse error: {}", e))?;
-    
-    // Add capture stats (from separate C++ module, has its own buffer)
-    let cap_json = ffi::get_capture_stats_json();
-    if let Ok(cap_stats) = serde_json::from_str::<Value>(&cap_json) {
-        poll_data["captureStats"] = cap_stats;
-    }
+    let cap_json  = ffi::get_capture_stats_json();
+    let ts_json   = ffi::get_timestamp_info_json();
 
-    // Add timestamp info (precision indicator for frontend)
-    let ts_json = ffi::get_timestamp_info_json();
-    if let Ok(ts_info) = serde_json::from_str::<Value>(&ts_json) {
-        poll_data["timestampInfo"] = ts_info;
-    }
+    // Merge the three JSON objects by string manipulation.
+    // poll_json is a complete JSON object ending with '}'.
+    // Strip that final '}' and append the two extra fields.
+    let merged = {
+        let base = poll_json.trim_end_matches(|c: char| c.is_whitespace());
+        if base.ends_with('}') {
+            format!(r#"{},"captureStats":{},"timestampInfo":{}}}"#,
+                &base[..base.len() - 1], cap_json, ts_json)
+        } else {
+            // Malformed poll_json — pass through and let RawValue catch it
+            poll_json.clone()
+        }
+    };
 
-    // ── SQLite recording: store frames if recording is active ──
-    // is_recording() is an atomic bool load (~1 cycle) — zero overhead when off
+    // SQLite recording path — only parse when recording is active (rare case).
+    // is_recording() is an atomic bool load (~1 CPU cycle).
     if db::is_recording() {
-        if let Some(frames) = poll_data["frames"].as_array() {
-            if !frames.is_empty() {
-                db::store_poll_frames(frames);
+        if let Ok(parsed) = serde_json::from_str::<Value>(&merged) {
+            if let Some(frames) = parsed["frames"].as_array() {
+                if !frames.is_empty() {
+                    db::store_poll_frames(frames);
+                }
             }
         }
     }
 
-    Ok(poll_data)
+    serde_json::value::RawValue::from_string(merged)
+        .map_err(|e| format!("Poll JSON invalid: {}", e))
 }
 
 /// Reset all subscriber state — clears ring buffer and analysis counters

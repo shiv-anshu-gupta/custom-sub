@@ -218,59 +218,70 @@ extern "C" int sv_subscriber_feed_decoded(const SvCompactFrame *compact,
     if (!compact || !svID) return -1;
     if (!g_ring) return -1;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
+    /* Capture the phasor CSV index under the lock; feed outside it.
+     * Previously sv_phasor_feed_sample + sv_phasor_csv_feed_stream (DFT/
+     * accumulation work) ran while holding g_mutex, contending with the
+     * poll-JSON builder.  Now the mutex covers only the ring-buffer write
+     * and analysis bookkeeping — the shortest possible critical section. */
+    int phasor_csv_idx = -1;
 
-    /* Find/create stream state */
-    StreamState *stream = find_or_create_stream(svID);
-    if (!stream) return -1;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
 
-    /* Update channel count */
-    if (compact->channelCount > stream->channelCount) {
-        stream->channelCount = compact->channelCount;
-    }
+        /* Find/create stream state */
+        StreamState *stream = find_or_create_stream(svID);
+        if (!stream) return -1;
 
-    /* Auto-detect smpCntMax */
-    auto_detect_smp_cnt_max(stream, compact->smpCnt);
+        /* Update channel count */
+        if (compact->channelCount > stream->channelCount) {
+            stream->channelCount = compact->channelCount;
+        }
 
-    /* Write to display ring */
-    uint32_t idx = g_ring_head % SUB_DISPLAY_CAPACITY;
-    StoredFrame *sf = &g_ring[idx];
-    sf->smpCnt = compact->smpCnt;
-    sf->confRev = compact->confRev;
-    sf->smpSynch = compact->smpSynch;
-    sf->channelCount = compact->channelCount;
-    memcpy(sf->values, compact->values, compact->channelCount * sizeof(int32_t));
-    memcpy(sf->quality, compact->quality, compact->channelCount * sizeof(uint32_t));
-    sf->errors = compact->errors;
-    sf->timestamp_us = compact->timestamp_us;
-    sf->appID = compact->appID;
-    sf->noASDU = compact->noASDU;
-    sf->asduIndex = compact->asduIndex;
-    strncpy(sf->svID, svID, SV_DEC_MAX_SVID_LEN);
-    sf->svID[SV_DEC_MAX_SVID_LEN] = '\0';
-    sf->frameIndex = g_total_frames;
+        /* Auto-detect smpCntMax */
+        auto_detect_smp_cnt_max(stream, compact->smpCnt);
 
-    /* Run analysis */
-    analyze_frame(stream, sf);
+        /* Write to display ring */
+        uint32_t idx = g_ring_head % SUB_DISPLAY_CAPACITY;
+        StoredFrame *sf = &g_ring[idx];
+        sf->smpCnt = compact->smpCnt;
+        sf->confRev = compact->confRev;
+        sf->smpSynch = compact->smpSynch;
+        sf->channelCount = compact->channelCount;
+        memcpy(sf->values, compact->values, compact->channelCount * sizeof(int32_t));
+        memcpy(sf->quality, compact->quality, compact->channelCount * sizeof(uint32_t));
+        sf->errors = compact->errors;
+        sf->timestamp_us = compact->timestamp_us;
+        sf->appID = compact->appID;
+        sf->noASDU = compact->noASDU;
+        sf->asduIndex = compact->asduIndex;
+        strncpy(sf->svID, svID, SV_DEC_MAX_SVID_LEN);
+        sf->svID[SV_DEC_MAX_SVID_LEN] = '\0';
+        sf->frameIndex = g_total_frames;
 
-    g_ring_head++;
-    if (g_ring_count < SUB_DISPLAY_CAPACITY) g_ring_count++;
-    g_total_frames++;
+        /* Run analysis */
+        analyze_frame(stream, sf);
 
-    /* Feed phasor engine (real-time mode) */
+        g_ring_head++;
+        if (g_ring_count < SUB_DISPLAY_CAPACITY) g_ring_count++;
+        g_total_frames++;
+
+        /* Auto-register CSV stream if not yet done (cheap string op) */
+        if (stream->phasorCsvIdx < 0 && stream->channelCount > 0 &&
+            stream->totalFrames > 10) {
+            uint16_t spc = (stream->smpCntMax == 65535) ? 80 : (stream->smpCntMax + 1);
+            stream->phasorCsvIdx = sv_phasor_csv_register_stream(
+                svID, spc, stream->channelCount);
+        }
+        phasor_csv_idx = stream->phasorCsvIdx;
+
+    } /* ── g_mutex released ─────────────────────────────────────────────── */
+
+    /* Feed phasor engines OUTSIDE the mutex so DFT computation never
+     * blocks sv_subscriber_get_poll_json on the poll thread. */
     sv_phasor_feed_sample(compact->values, compact->channelCount,
                           compact->timestamp_us);
-
-    /* Feed phasor CSV engine (if stream is registered) */
-    if (stream->phasorCsvIdx < 0 && stream->channelCount > 0 &&
-        stream->totalFrames > 10) {
-        /* Auto-register stream with CSV engine */
-        uint16_t spc = (stream->smpCntMax == 65535) ? 80 : (stream->smpCntMax + 1);
-        stream->phasorCsvIdx = sv_phasor_csv_register_stream(
-            svID, spc, stream->channelCount);
-    }
-    if (stream->phasorCsvIdx >= 0) {
-        sv_phasor_csv_feed_stream(stream->phasorCsvIdx, compact->values,
+    if (phasor_csv_idx >= 0) {
+        sv_phasor_csv_feed_stream(phasor_csv_idx, compact->values,
                                    compact->channelCount, compact->timestamp_us);
     }
 
@@ -346,118 +357,159 @@ extern "C" void sv_subscriber_init(const char *sv_id, uint16_t smp_cnt_max) {
 
 extern "C" const char* sv_subscriber_get_poll_json(uint32_t start_index,
                                                      uint32_t max_frames) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-
     if (!g_json_buf) return "{}";
 
-    int pos = 0;
-    int cap = SUB_JSON_BUF_SIZE;
+    /* ── Snapshot phase: hold g_mutex only long enough to copy data ──────────
+     * Previously the entire JSON build (up to ~16,000 vsnprintf calls for
+     * 2000 frames × 8 channels) ran under g_mutex, blocking the drain thread
+     * every poll cycle (~3×/sec).  Now we do a bounded memcpy of up to 2000
+     * StoredFrame structs under the lock, release it immediately, then build
+     * the JSON with no lock held so the drain thread runs freely.           */
 
-    pos = json_append(g_json_buf, pos, cap, "{\"totalFrames\":%u,\"totalReceived\":%u,\"ringCount\":%u,",
-                      g_total_frames, g_total_frames, g_ring_count);
+    /* Static buffers — poll is serialised by the JS _pollInFlight guard     */
+    static StoredFrame s_snap[2000];
+    static char        s_primary_svID[SV_DEC_MAX_SVID_LEN + 1];
 
-    /* --- Frames array --- */
-    pos = json_append(g_json_buf, pos, cap, "\"frames\":[");
+    int      snap_count = 0;
+    uint32_t snap_total = 0, snap_ring = 0;
 
-    if (g_ring_count > 0 && max_frames > 0) {
-        /* Determine range to return */
-        uint32_t oldest_index = (g_total_frames > SUB_DISPLAY_CAPACITY)
-            ? (g_total_frames - SUB_DISPLAY_CAPACITY) : 0;
+    uint64_t agg_total = 0, agg_missing = 0, agg_ooo = 0, agg_dup = 0, agg_err = 0;
+    uint16_t primary_smpCntMax = 0, primary_lastSmpCnt = 0;
+    int      snap_streams = 0;
 
-        uint32_t from = (start_index > oldest_index) ? start_index : oldest_index;
-        uint32_t to = g_total_frames;
-        if ((to - from) > max_frames) from = to - max_frames;
+    SvPhasorResult phasor_snap;
+    memset(&phasor_snap, 0, sizeof(phasor_snap));
 
-        int first = 1;
-        for (uint32_t fi = from; fi < to; fi++) {
-            uint32_t ri = fi % SUB_DISPLAY_CAPACITY;
-            StoredFrame *sf = &g_ring[ri];
-
-            if (!first) pos = json_append(g_json_buf, pos, cap, ",");
-            first = 0;
-
-            pos = json_append(g_json_buf, pos, cap,
-                "{\"index\":%u,\"smpCnt\":%u,\"confRev\":%u,\"smpSynch\":%u,"
-                "\"channelCount\":%u,\"appID\":%u,\"timestamp\":%llu,\"errors\":%u,"
-                "\"svID\":\"%s\",\"noASDU\":%u,\"asduIndex\":%u,"
-                "\"analysis\":{\"flags\":%u,\"expected\":%u,\"actual\":%u,"
-                "\"gapSize\":%u,\"missingFrom\":%u,\"missingTo\":%u,\"dupTsGroupSize\":1},"
-                "\"channels\":[",
-                sf->frameIndex, (unsigned)sf->smpCnt, (unsigned)sf->confRev,
-                (unsigned)sf->smpSynch, (unsigned)sf->channelCount,
-                (unsigned)sf->appID, (unsigned long long)sf->timestamp_us,
-                (unsigned)sf->errors, sf->svID,
-                (unsigned)sf->noASDU, (unsigned)sf->asduIndex,
-                (unsigned)sf->analysisFlags, (unsigned)sf->expectedSmpCnt,
-                (unsigned)sf->smpCnt,
-                (unsigned)sf->gapSize,
-                (unsigned)((sf->analysisFlags & SV_ANALYSIS_MISSING_SEQ) ?
-                    sf->expectedSmpCnt : 0),
-                (unsigned)((sf->analysisFlags & SV_ANALYSIS_MISSING_SEQ) ?
-                    ((sf->expectedSmpCnt + sf->gapSize - 1) % 65536) : 0));
-
-            for (int c = 0; c < sf->channelCount; c++) {
-                pos = json_append(g_json_buf, pos, cap, "%s%d",
-                                  c > 0 ? "," : "", sf->values[c]);
-            }
-            pos = json_append(g_json_buf, pos, cap, "]}");
-        }
-    }
-
-    pos = json_append(g_json_buf, pos, cap, "],");
-
-    /* --- Analysis summary (flattened from primary stream for frontend) --- */
     {
-        uint64_t agg_total = 0, agg_missing = 0, agg_ooo = 0, agg_dup = 0, agg_err = 0;
-        const char *primary_svID = "";
-        uint16_t primary_smpCntMax = 0;
-        uint16_t primary_lastSmpCnt = 0;
+        std::lock_guard<std::mutex> lock(g_mutex);
 
+        snap_total = g_total_frames;
+        snap_ring  = g_ring_count;
+
+        if (g_ring_count > 0 && max_frames > 0) {
+            uint32_t oldest = (g_total_frames > SUB_DISPLAY_CAPACITY)
+                ? (g_total_frames - SUB_DISPLAY_CAPACITY) : 0;
+            uint32_t from = (start_index > oldest) ? start_index : oldest;
+            uint32_t to   = g_total_frames;
+            if ((to - from) > max_frames) from = to - max_frames;
+
+            uint32_t count = to - from;
+            if (count > 2000) count = 2000;
+            for (uint32_t i = 0; i < count; i++)
+                s_snap[snap_count++] = g_ring[(from + i) % SUB_DISPLAY_CAPACITY];
+        }
+
+        snap_streams      = g_stream_count;
+        s_primary_svID[0] = '\0';
         for (int i = 0; i < g_stream_count; i++) {
             StreamState *s = &g_streams[i];
-            agg_total += s->totalFrames;
+            agg_total   += s->totalFrames;
             agg_missing += s->missingCount;
-            agg_ooo += s->outOfOrderCount;
-            agg_dup += s->duplicateCount;
-            agg_err += s->errorCount;
+            agg_ooo     += s->outOfOrderCount;
+            agg_dup     += s->duplicateCount;
+            agg_err     += s->errorCount;
             if (i == 0) {
-                primary_svID = s->svID;
-                primary_smpCntMax = s->smpCntMax;
+                strncpy(s_primary_svID, s->svID, SV_DEC_MAX_SVID_LEN);
+                s_primary_svID[SV_DEC_MAX_SVID_LEN] = '\0';
+                primary_smpCntMax  = s->smpCntMax;
                 primary_lastSmpCnt = s->lastSmpCnt;
             }
         }
 
+        /* Copy phasor result atomically while still under lock */
+        phasor_snap = *sv_phasor_get_result();
+
+    } /* ── g_mutex released — drain thread runs freely during JSON build ── */
+
+    /* ── Build JSON from snapshot — no lock held ────────────────────────── */
+    int pos = 0;
+    int cap = SUB_JSON_BUF_SIZE;
+
+    pos = json_append(g_json_buf, pos, cap,
+        "{\"totalFrames\":%u,\"totalReceived\":%u,\"ringCount\":%u,",
+        snap_total, snap_total, snap_ring);
+
+    /* --- Frames array --- */
+    pos = json_append(g_json_buf, pos, cap, "\"frames\":[");
+
+    bool truncated = false;
+    for (int si = 0; si < snap_count; si++) {
+        StoredFrame *sf = &s_snap[si];
+
+        /* Reserve ~2 KB for the analysis/phasor/status tail; emit valid JSON */
+        if (cap - pos < 2048) {
+            truncated = true;
+            break;
+        }
+
+        if (si > 0) pos = json_append(g_json_buf, pos, cap, ",");
+
         pos = json_append(g_json_buf, pos, cap,
-            "\"analysis\":{\"totalFrames\":%llu,\"svID\":\"%s\","
-            "\"missingCount\":%llu,\"outOfOrderCount\":%llu,"
-            "\"duplicateCount\":%llu,\"errorCount\":%llu,"
-            "\"lastSmpCnt\":%u,\"smpCntMax\":%u,\"streamCount\":%d},",
-            (unsigned long long)agg_total, primary_svID,
-            (unsigned long long)agg_missing, (unsigned long long)agg_ooo,
-            (unsigned long long)agg_dup, (unsigned long long)agg_err,
-            (unsigned)primary_lastSmpCnt, (unsigned)primary_smpCntMax,
-            g_stream_count);
+            "{\"index\":%u,\"smpCnt\":%u,\"confRev\":%u,\"smpSynch\":%u,"
+            "\"channelCount\":%u,\"appID\":%u,\"timestamp\":%llu,\"errors\":%u,"
+            "\"svID\":\"%s\",\"noASDU\":%u,\"asduIndex\":%u,"
+            "\"analysis\":{\"flags\":%u,\"expected\":%u,\"actual\":%u,"
+            "\"gapSize\":%u,\"missingFrom\":%u,\"missingTo\":%u,\"dupTsGroupSize\":1},"
+            "\"channels\":[",
+            sf->frameIndex, (unsigned)sf->smpCnt, (unsigned)sf->confRev,
+            (unsigned)sf->smpSynch, (unsigned)sf->channelCount,
+            (unsigned)sf->appID, (unsigned long long)sf->timestamp_us,
+            (unsigned)sf->errors, sf->svID,
+            (unsigned)sf->noASDU, (unsigned)sf->asduIndex,
+            (unsigned)sf->analysisFlags, (unsigned)sf->expectedSmpCnt,
+            (unsigned)sf->smpCnt,
+            (unsigned)sf->gapSize,
+            (unsigned)((sf->analysisFlags & SV_ANALYSIS_MISSING_SEQ) ?
+                sf->expectedSmpCnt : 0),
+            (unsigned)((sf->analysisFlags & SV_ANALYSIS_MISSING_SEQ) ?
+                ((sf->expectedSmpCnt + sf->gapSize - 1) % 65536) : 0));
+
+        for (int c = 0; c < sf->channelCount; c++) {
+            pos = json_append(g_json_buf, pos, cap, "%s%d",
+                              c > 0 ? "," : "", sf->values[c]);
+        }
+        pos = json_append(g_json_buf, pos, cap, "]}");
     }
 
-    /* --- Phasor result (real-time) --- */
-    const SvPhasorResult *pr = sv_phasor_get_result();
+    /* Close frames array — add truncated flag when buffer was too small    */
+    if (truncated) {
+        pos = json_append(g_json_buf, pos, cap, "],\"truncated\":true,");
+    } else {
+        pos = json_append(g_json_buf, pos, cap, "],");
+    }
+
+    /* --- Analysis summary --- */
+    pos = json_append(g_json_buf, pos, cap,
+        "\"analysis\":{\"totalFrames\":%llu,\"svID\":\"%s\","
+        "\"missingCount\":%llu,\"outOfOrderCount\":%llu,"
+        "\"duplicateCount\":%llu,\"errorCount\":%llu,"
+        "\"lastSmpCnt\":%u,\"smpCntMax\":%u,\"streamCount\":%d},",
+        (unsigned long long)agg_total, s_primary_svID,
+        (unsigned long long)agg_missing, (unsigned long long)agg_ooo,
+        (unsigned long long)agg_dup, (unsigned long long)agg_err,
+        (unsigned)primary_lastSmpCnt, (unsigned)primary_smpCntMax,
+        snap_streams);
+
+    /* --- Phasor result --- */
     pos = json_append(g_json_buf, pos, cap,
         "\"phasor\":{\"valid\":%d,\"mode\":%d,\"windowSize\":%u,"
         "\"computeCount\":%u,\"channels\":[",
-        pr->valid, pr->mode, pr->windowSize, pr->computeCount);
-    if (pr->valid) {
-        for (int c = 0; c < pr->channelCount; c++) {
+        phasor_snap.valid, phasor_snap.mode, phasor_snap.windowSize,
+        phasor_snap.computeCount);
+    if (phasor_snap.valid) {
+        for (int c = 0; c < phasor_snap.channelCount; c++) {
             if (c > 0) pos = json_append(g_json_buf, pos, cap, ",");
             pos = json_append(g_json_buf, pos, cap, "{\"mag\":%.6f,\"ang\":%.4f}",
-                              pr->channels[c].magnitude, pr->channels[c].angle_deg);
+                              phasor_snap.channels[c].magnitude,
+                              phasor_snap.channels[c].angle_deg);
         }
     }
     pos = json_append(g_json_buf, pos, cap, "]},");
 
-    /* --- Status (buffer usage for footer) --- */
+    /* --- Status --- */
     pos = json_append(g_json_buf, pos, cap,
         "\"status\":{\"bufferUsed\":%u,\"bufferCapacity\":%u}",
-        g_ring_count, (unsigned)SUB_DISPLAY_CAPACITY);
+        snap_ring, (unsigned)SUB_DISPLAY_CAPACITY);
 
     pos = json_append(g_json_buf, pos, cap, "}");
 
