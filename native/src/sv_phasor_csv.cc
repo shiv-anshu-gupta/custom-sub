@@ -172,6 +172,8 @@ typedef struct {
     /* Sliding-window state (mode 2 only) */
     uint8_t     windowFull;         /* 1 once first N samples collected */
     uint32_t    ringHead;           /* Circular write pointer (0..N-1) */
+    uint32_t    slideStep;          /* Run FFT every N/4 samples, not every sample */
+    uint32_t    slideCount;         /* Counter mod slideStep */
 
     /* Results (latest computation) */
     double      magnitude[PCSV_MAX_CHANNELS];
@@ -268,7 +270,10 @@ static int engine_init(PhasorEngine *eng, uint8_t mode,
 
     /* Sliding-window extra state */
     eng->windowFull = 0;
-    eng->ringHead = 0;
+    eng->ringHead   = 0;
+    /* Step = N/4 → ~200 FFTs/sec instead of 4000 FFTs/sec (~20× reduction) */
+    eng->slideStep  = (eng->windowSize / 4 > 0) ? eng->windowSize / 4 : 1;
+    eng->slideCount = 0;
 
     /* Initialize stats with sentinel values */
     eng->stats.minComputeTimeUs = 1e12;
@@ -503,6 +508,11 @@ static void engine_feed_slide_with_stream(const char *svID, PhasorEngine *eng,
     eng->ringHead = (eng->ringHead + 1) % W;
     eng->lastTimestamp = timestamp_us;
 
+    /* Skip FFT until slideStep boundary — reduces FFT rate from 4000/s to ~200/s */
+    eng->slideCount++;
+    if (eng->slideCount < eng->slideStep) return;
+    eng->slideCount = 0;
+
     /* Linearize the circular buffer for engine_compute() */
     double tmpBuf[PCSV_MAX_WINDOW_SIZE];
     if (eng->ringHead != 0) {
@@ -690,6 +700,10 @@ int sv_phasor_csv_reinit_stream(int streamIdx, uint16_t samplesPerCycle,
 void sv_phasor_csv_feed_stream(int streamIdx, const int32_t *values,
                                 uint8_t channelCount, uint64_t timestamp_us)
 {
+    /* No CSV file open → nothing to compute or write.  This guard eliminates
+     * all three FFT engines (~32 000 calls/sec) during normal live viewing. */
+    if (!g_csvFile) return;
+
     if (streamIdx < 0 || streamIdx >= g_csvStreamCount) return;
     StreamCsvSet *set = &g_csvStreams[streamIdx];
     if (!set->active || !values) return;

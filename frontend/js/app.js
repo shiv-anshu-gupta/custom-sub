@@ -199,26 +199,10 @@ async function connect() {
         SVTiming.setDisabled(true);
         SVTiming.startSession();       // Start timing session tracking
 
-        // Start SQLite recording session (non-fatal if DB unavailable)
-        try {
-            const timingConfig = SVTiming.getConfig();
-            const dbResult = await backendCall('db_start_session', {
-                config: {
-                    svId: svID,
-                    smpCntMax: smpCntMax,
-                    interfaceName: iface,
-                    captureMode: timingConfig.captureMode,
-                    durationSec: timingConfig.durationSec,
-                    repeatMode: timingConfig.repeatMode,
-                    repeatCount: timingConfig.repeatCount,
-                }
-            });
-            SVApp._dbSessionId = dbResult.sessionId;
-            console.log('[app] SQLite recording started — session #' + dbResult.sessionId);
-        } catch (err) {
-            console.warn('[app] SQLite session start failed (non-fatal):', err);
-            SVApp._dbSessionId = null;
-        }
+        // SQLite recording is NOT started automatically — it must be explicitly
+        // triggered by the user (e.g. a "Record" button).  Auto-starting caused
+        // SQLite batch inserts + JSON parsing on every poll even during normal
+        // live viewing, adding ~2% per-core CPU for no benefit.
 
         startPolling();
     } catch (err) {

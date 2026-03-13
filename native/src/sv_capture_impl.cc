@@ -328,7 +328,11 @@ static void capture_thread_func() {
             /* feed_rc == -1 means decode error (not SV / malformed) — skip */
 
         } else if (rc == 0) {
-            /* Timeout — no packet available, loop continues */
+            /* Timeout — no packet available.
+             * Yield for 100 µs as a guard against libpcap builds that return
+             * rc=0 without blocking (non-blocking immediate mode variants).
+             * At 4000 pkt/s this path fires <10×/sec so the sleep is free. */
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         } else if (rc == -1) {
             /* Error */
             printf("[capture] pcap_next_ex error: %s\n", pcap_geterr(g_pcap));

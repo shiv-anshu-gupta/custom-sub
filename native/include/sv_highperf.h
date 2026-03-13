@@ -57,8 +57,10 @@ extern "C" {
 /** Drain thread batch size — how many frames to process per drain tick */
 #define SV_DRAIN_BATCH_MAX      100000
 
-/** Drain thread interval (ms) */
-#define SV_DRAIN_INTERVAL_MS    25
+/** Drain thread interval (ms).
+ *  50 ms → 200 frames/batch at 4000 Hz; 20 wakeups/sec instead of 40.
+ *  JS polls at 300 ms so drain latency is still 6× below the poll interval. */
+#define SV_DRAIN_INTERVAL_MS    50
 
 /** Compact frame for SPSC — only essential fields, no strings, minimal size */
 #define SV_COMPACT_MAX_CH       20

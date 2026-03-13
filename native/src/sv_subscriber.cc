@@ -30,8 +30,11 @@
  * Configuration
  *============================================================================*/
 
-#define SUB_DISPLAY_CAPACITY    20000   /**< Display ring buffer size */
-#define SUB_JSON_BUF_SIZE       (4 * 1024 * 1024) /**< 4 MB JSON buffer */
+#define SUB_DISPLAY_CAPACITY    4000    /**< Display ring buffer size — JS max request is
+                                          *   2000 frames; 4000 gives 2× safety margin and
+                                          *   keeps g_ring at ~1 MB (fits in L3 cache). */
+#define SUB_JSON_BUF_SIZE       (1024 * 1024) /**< 1 MB JSON buffer — 2000 frames × ~350 B
+                                                *   ≈ 700 KB; 1 MB leaves comfortable margin. */
 #define SUB_MAX_STREAMS         32      /**< Max unique svIDs tracked */
 
 /*============================================================================
@@ -292,6 +295,22 @@ extern "C" int sv_subscriber_feed_decoded(const SvCompactFrame *compact,
  * JSON Helpers
  *============================================================================*/
 
+/* Fast direct int32 → decimal writer. ~10× faster than vsnprintf("%d")
+ * because it skips format-string parsing and va_list overhead.
+ * Buffer must have at least 12 bytes available (sign + 10 digits + NUL). */
+static inline int fast_write_int32(char *buf, int32_t v) {
+    uint32_t u;
+    char tmp[11];
+    int n = 0;
+    char *p = buf;
+    if (v < 0) { *p++ = '-'; u = (uint32_t)(-(int64_t)v); }
+    else        {             u = (uint32_t)v; }
+    if (u == 0) { *p++ = '0'; return (int)(p - buf); }
+    do { tmp[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+    for (int i = n - 1; i >= 0; i--) *p++ = tmp[i];
+    return (int)(p - buf);
+}
+
 static int json_append(char *buf, int pos, int capacity, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -464,9 +483,13 @@ extern "C" const char* sv_subscriber_get_poll_json(uint32_t start_index,
             (unsigned)((sf->analysisFlags & SV_ANALYSIS_MISSING_SEQ) ?
                 ((sf->expectedSmpCnt + sf->gapSize - 1) % 65536) : 0));
 
+        /* Fast channel serialization — direct int32 writer bypasses vsnprintf
+         * format-parse overhead (this loop runs 16 000×/poll × 3/sec). */
         for (int c = 0; c < sf->channelCount; c++) {
-            pos = json_append(g_json_buf, pos, cap, "%s%d",
-                              c > 0 ? "," : "", sf->values[c]);
+            if (pos < cap - 13) {          /* 12 digits + sign + comma */
+                if (c > 0) g_json_buf[pos++] = ',';
+                pos += fast_write_int32(g_json_buf + pos, sf->values[c]);
+            }
         }
         pos = json_append(g_json_buf, pos, cap, "]}");
     }
